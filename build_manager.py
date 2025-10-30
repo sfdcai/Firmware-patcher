@@ -31,8 +31,12 @@ CONFIG: Dict[str, str] = {
     "vendor_user": os.environ.get("BUILD_VENDOR_USER", "root"),
     "vendor_host": os.environ.get("BUILD_VENDOR_HOST", "192.168.1.190"),
     "vendor_path": os.environ.get("BUILD_VENDOR_PATH", "/lib/firmware"),
+    "backup_user": os.environ.get("BUILD_BACKUP_USER", "root"),
     "backup_host": os.environ.get("BUILD_BACKUP_HOST", "192.168.1.190"),
     "backup_path": os.environ.get("BUILD_BACKUP_PATH", "/"),
+    "backup_local": os.environ.get(
+        "BUILD_BACKUP_LOCAL", os.path.expanduser("~/ra74-backups")
+    ),
     "build_root": os.environ.get("BUILD_ROOT", "./builder_workspace"),
     "repo_url": os.environ.get(
         "BUILD_REPO_URL", "https://github.com/immortalwrt/immortalwrt.git"
@@ -44,7 +48,7 @@ CONFIG: Dict[str, str] = {
         "bin/targets/qualcommax/ipq50xx/*ra74*sysupgrade*.bin",
     ),
     "vendor_assets_local": os.environ.get(
-        "BUILD_VENDOR_ASSETS", os.path.expanduser("~/ra74-fw")
+        "BUILD_VENDOR_ASSETS", "./builder_workspace/vendor_assets"
     ),
 }
 
@@ -117,7 +121,7 @@ class BuildManager:
         self.cleanup_paths: List[Path] = []
         self.repo_dir = Path(CONFIG["build_root"]) / CONFIG["repo_name"]
         self.overlay_dir = self.repo_dir / "files"
-        self.vendor_assets_dir = Path(CONFIG["build_root"]) / "vendor_assets"
+        self.vendor_assets_dir = Path(CONFIG["vendor_assets_local"]).expanduser()
         self.dry_run = DRY_RUN
 
         # Register signal handlers and cleanup routines to emulate shell traps.
@@ -172,6 +176,29 @@ class BuildManager:
             return subprocess.run(command, cwd=str(cwd) if cwd else None)
         return subprocess.run(command, cwd=str(cwd) if cwd else None, check=check)
 
+    def _run_command_to_file(
+        self,
+        command: Sequence[str],
+        destination: Path,
+        allow_failure: bool = False,
+    ) -> None:
+        cmd_display = " ".join(shlex_quote(part) for part in command)
+        self.logger.info(f"Streaming command output to {destination}: {cmd_display}")
+        if self.dry_run:
+            self.logger.ok(
+                f"Dry-run mode: would capture command output to {destination}."
+            )
+            return
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("wb") as handle:
+            result = subprocess.run(command, stdout=handle, check=not allow_failure)
+        if result.returncode != 0 and allow_failure:
+            self.logger.warn(
+                f"Command returned {result.returncode}; kept existing data for {destination}."
+            )
+        else:
+            self.logger.ok(f"Captured output to {destination}.")
+
     def _write_file(self, path: Path, content: str) -> None:
         if self.dry_run:
             self.logger.ok(f"Dry-run mode: would write file {path}.")
@@ -196,67 +223,102 @@ class BuildManager:
         self._record_summary("Preflight checks", "OK")
 
     def backup_important_files(self) -> None:
-        self.logger.info("Backing up critical files via simulated SSH copy.")
-        backup_target = Path(CONFIG["build_root"]) / "backups"
-        if not self.dry_run:
-            backup_target.mkdir(parents=True, exist_ok=True)
-            placeholder = backup_target / "config_backup.txt"
-            placeholder.write_text(
-                textwrap.dedent(
-                    f"""
-                    Backup generated on {datetime.utcnow().isoformat()}Z
-                    Source host: {CONFIG['backup_host']}
-                    Remote path: {CONFIG['backup_path']}
-                    """
-                ).strip()
-                + "\n",
-                encoding="utf-8",
-            )
+        self.logger.info("Backing up critical router data over SSH.")
+        backup_target = Path(CONFIG["backup_local"]).expanduser()
+        backup_target.mkdir(parents=True, exist_ok=True)
+        remote = f"{CONFIG['backup_user']}@{CONFIG['backup_host']}"
+
+        info_commands: Sequence[Tuple[str, Sequence[str]]] = (
+            ("proc-mtd.txt", ["ssh", remote, "cat /proc/mtd"]),
+            ("dmesg.txt", ["ssh", remote, "dmesg"]),
+            ("cmdline.txt", ["ssh", remote, "cat /proc/cmdline"]),
+        )
+        for filename, command in info_commands:
+            destination = backup_target / filename
+            self._run_command_to_file(command, destination)
+
+        partition_spec = os.environ.get(
+            "BUILD_BACKUP_PARTITIONS",
+            "mtd22:kernel,mtd23:ubi_rootfs,mtd20:overlay,mtd24:data,mtd13:ART",
+        )
+        partitions: List[Tuple[str, str]] = []
+        for entry in partition_spec.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if ":" in entry:
+                name, label = entry.split(":", 1)
+            else:
+                name, label = entry, entry
+            partitions.append((name.strip(), label.strip()))
+
+        for device, label in partitions:
+            filename = f"{device}-{label}.bin" if label else f"{device}.bin"
+            command = ["ssh", remote, f"dd if=/dev/{device} bs=1M"]
+            destination = backup_target / filename
+            self._run_command_to_file(command, destination)
+
+        checksums_path = backup_target / "checksums.sha256"
+        if self.dry_run:
+            self.logger.ok("Dry-run mode: would generate SHA256 sums for backups.")
+        else:
+            with checksums_path.open("w", encoding="utf-8") as handle:
+                for item in sorted(backup_target.iterdir()):
+                    if item == checksums_path or item.is_dir():
+                        continue
+                    digest = self._sha256(item)
+                    handle.write(f"{digest}  {item.name}\n")
+            self.logger.ok(f"Wrote backup checksums to {checksums_path}.")
+
         self.logger.ok(
-            "Simulated backup completed. Data stored under %s"
-            % backup_target.resolve()
+            "Backups stored under %s" % backup_target.resolve()
         )
         self._record_summary("Backup", "OK")
 
     def fetch_vendor_blobs(self) -> None:
-        self.logger.info("Fetching vendor assets via simulated rsync.")
-        if not self.dry_run:
-            self.vendor_assets_dir.mkdir(parents=True, exist_ok=True)
-            firmware_targets = {
-                "IPQ5018": "ath11k board data and firmware",
-                "qcn9000": "optional 5G board data",
-                "qca-nss0-retail.bin": "NSS acceleration blob",
-            }
-            for name, description in firmware_targets.items():
-                destination = self.vendor_assets_dir / name
-                if destination.exists():
-                    continue
-                if destination.suffix:
-                    destination.write_text(
-                        textwrap.dedent(
-                            f"""
-                            Placeholder for {description} collected from
-                            {CONFIG['vendor_user']}@{CONFIG['vendor_host']}:{CONFIG['vendor_path']}.
-                            Replace with the real binary before building.
-                            """
-                        ).strip()
-                        + "\n",
-                        encoding="utf-8",
-                    )
+        self.logger.info("Fetching vendor firmware and NSS blobs via rsync/scp.")
+        remote = f"{CONFIG['vendor_user']}@{CONFIG['vendor_host']}"
+        remote_base = CONFIG["vendor_path"].rstrip("/")
+        targets: Sequence[Tuple[str, bool]] = (
+            ("IPQ5018", False),
+            ("qcn9000", True),
+            ("qca-nss0-retail.bin", True),
+        )
+
+        self.vendor_assets_dir.mkdir(parents=True, exist_ok=True)
+        for name, optional in targets:
+            remote_path = f"{remote_base}/{name}"
+            self.logger.info(
+                f"Syncing {remote_path} from {remote} into {self.vendor_assets_dir}."
+            )
+            if self.dry_run:
+                self.logger.ok(
+                    "Dry-run mode: would transfer %s to local vendor assets." % name
+                )
+                continue
+            command = [
+                "rsync",
+                "-av",
+                f"{remote}:{remote_path}",
+                str(self.vendor_assets_dir),
+            ]
+            result = subprocess.run(command, check=False)
+            if result.returncode != 0:
+                message = (
+                    f"Failed to fetch {name} (return code {result.returncode})."
+                )
+                if optional:
+                    self.logger.warn(message + " Continuing; file marked optional.")
                 else:
-                    destination.mkdir(parents=True, exist_ok=True)
-                    (destination / "README.txt").write_text(
-                        textwrap.dedent(
-                            f"""
-                            Placeholder directory for {description} collected from
-                            {CONFIG['vendor_user']}@{CONFIG['vendor_host']}:{CONFIG['vendor_path']}.
-                            Replace with the real contents before building.
-                            """
-                        ).strip()
-                        + "\n",
-                        encoding="utf-8",
-                    )
-        self.logger.ok(f"Vendor assets available at {self.vendor_assets_dir.resolve()}.")
+                    self.logger.err(message)
+                    self._record_summary("Vendor assets", "FAILED")
+                    raise RuntimeError(message)
+            else:
+                self.logger.ok(f"Fetched {name} into vendor assets directory.")
+
+        self.logger.ok(
+            f"Vendor assets available at {self.vendor_assets_dir.resolve()}"
+        )
         self._record_summary("Vendor assets", "OK")
 
     def clone_or_update_repo(self) -> None:
@@ -289,6 +351,13 @@ class BuildManager:
                 "Dry-run mode: creating placeholder repository directory for subsequent steps."
             )
             self.repo_dir.mkdir(parents=True, exist_ok=True)
+        if not self.dry_run:
+            self._run_command(["./scripts/feeds", "update", "-a"], cwd=self.repo_dir)
+            self._run_command(["./scripts/feeds", "install", "-a"], cwd=self.repo_dir)
+        else:
+            self.logger.ok(
+                "Dry-run mode: would run './scripts/feeds update -a' and 'install -a'."
+            )
         self.logger.ok("Repository synchronised.")
         self._record_summary("Repository sync", "OK")
 
@@ -476,7 +545,7 @@ class BuildManager:
         if not self.dry_run:
             firmware_root = overlay_tmp / "lib" / "firmware"
             firmware_root.mkdir(parents=True, exist_ok=True)
-            source_dir = Path(CONFIG["vendor_assets_local"])
+            source_dir = self.vendor_assets_dir
             if source_dir.exists():
                 for item in source_dir.iterdir():
                     destination = firmware_root / item.name
