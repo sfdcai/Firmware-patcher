@@ -59,6 +59,7 @@ def menu2_show():
   print(' 7 - Install Breed bootloader')
   print(' 8 - __test__')
   print(' 9 - [[ Reboot device ]]')
+  print('10 - Launch build workflow manager')
   print(' 0 - Return to main menu')
 
 def menu2_process(id):
@@ -73,7 +74,8 @@ def menu2_process(id):
   if id == 7: return [ "install_bl.py", "breed" ]
   if id == 8: return "test.py"
   if id == 9: return "reboot.py"
-  if id == 0: return "__menu1" 
+  if id == 10: return "build_manager.py"
+  if id == 0: return "__menu1"
   return None
 
 def menu_show(level):
