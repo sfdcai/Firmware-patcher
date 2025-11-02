@@ -24,6 +24,9 @@ touching device bootloaders.
   checksum generation help you maintain reliable fallbacks.
 * **Vendor blob integration** – pulls Qualcomm Wi-Fi/NSS firmware directly from
   the router and injects the assets into the ImmortalWrt `files/` overlay.
+* **Dynamic RA74 web dashboard** – generates a lightweight status/config page
+  that can ride on the stock MiWiFi/uHTTPd service or on an embedded busybox
+  HTTP daemon with optional custom binaries.
 
 ---
 
@@ -71,15 +74,46 @@ same menu-driven interface as the Windows entrypoint.
      workspace.
    * **Repository sync** – clones or updates ImmortalWrt, updates feeds, and
      applies the RA74 DTS/Makefile patches.
-   * **Overlay preparation** – copies fetched blobs, writes first-boot scripts,
-     and makes them executable.
-   * **Build** – launches `make menuconfig` followed by a parallel
-     `make -j$(nproc)` compile.
-   * **Artifact verification** – locates the newest `*ra74*sysupgrade*.bin` and
-     records its SHA256 hash.
+  * **Overlay preparation** – copies fetched blobs, writes first-boot scripts,
+    installs the web dashboard assets, and makes executables ready for boot.
+  * **Build** – launches `make menuconfig` followed by a parallel
+    `make -j$(nproc)` compile.
+  * **Artifact verification** – locates the newest `*ra74*sysupgrade*.bin` and
+    records its SHA256 hash.
 
 All stages honour the global `DRY_RUN=true` environment variable so you can
 exercise the workflow without executing external commands.
+
+### Router capability inventory
+
+The repository ships `router_command_inventory.sh`, a self-contained utility
+that inspects the commands present on the router and captures the associated
+version strings. The build manager automatically drops it into the firmware
+overlay at `/usr/sbin/ra74-command-inventory`, so every custom image exposes the
+tool out of the box.
+
+Run it locally on the router via SSH:
+
+```sh
+/usr/sbin/ra74-command-inventory
+```
+
+Or execute it from the build workspace against a remote shell:
+
+```sh
+scp router_command_inventory.sh root@192.168.1.190:/tmp/
+ssh root@192.168.1.190 '/tmp/router_command_inventory.sh -o /tmp/command-inventory.txt'
+scp root@192.168.1.190:/tmp/command-inventory.txt ./
+```
+
+Key behaviours:
+
+* Scans `$PATH` for every executable and merges optional command lists supplied
+  via `-c/--command` or `-f/--file`.
+* Attempts common `--version`, `-V`, and `-v` flags; BusyBox applets inherit the
+  BusyBox version banner automatically.
+* Produces a clean table that includes each command name, its resolved path, and
+  the detected version or `unknown` if the tool is silent.
 
 ---
 
@@ -91,6 +125,27 @@ exercise the workflow without executing external commands.
   artifact you plan to transfer.
 * **Keep fallbacks handy** – store stock firmware and your NAND dumps on a
   separate machine to simplify recovery.
+
+---
+
+## Custom web interface options
+
+The build manager can bake a simple dashboard that surfaces live router
+statistics and allows SSID tweaks without SSH access. Control its behaviour via
+environment variables before launching `build_manager.py`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BUILD_WEB_STRATEGY` | `reuse` | Choose `reuse` to publish under `/www/ra74` using the stock MiWiFi/uHTTPd instance, or `standalone` to bundle a dedicated service under `/usr/share/ra74-web`. |
+| `BUILD_WEB_PORT` | `8081` | Listening port for the standalone service (ignored when `reuse`). |
+| `BUILD_WEB_BINARY` | *(blank)* | Optional path to a custom HTTP server binary on the build host. When provided, the binary is copied into `/usr/bin/ra74-httpd` and launched by the standalone service. |
+| `BUILD_WEB_ARGS` | *(auto)* | Extra arguments passed to the standalone server. Use `{DOCROOT}` and `{PORT}` placeholders to interpolate runtime values. |
+
+The generated page lives at `/www/ra74/index.html` (stock server) or the root
+of the standalone service. JavaScript calls into `ra74_status.sh` for live JSON
+metrics and `ra74_apply.sh` to push configuration updates. The standalone mode
+ships an init script (`/etc/init.d/ra74-web`) so the service respawns via procd
+after boot or crashes.
 
 ---
 

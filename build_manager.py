@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from shlex import quote as shlex_quote
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -50,6 +51,10 @@ CONFIG: Dict[str, str] = {
     "vendor_assets_local": os.environ.get(
         "BUILD_VENDOR_ASSETS", "./builder_workspace/vendor_assets"
     ),
+    "web_strategy": os.environ.get("BUILD_WEB_STRATEGY", "reuse"),
+    "web_listen_port": os.environ.get("BUILD_WEB_PORT", "8081"),
+    "web_binary_source": os.environ.get("BUILD_WEB_BINARY", ""),
+    "web_standalone_args": os.environ.get("BUILD_WEB_ARGS", ""),
 }
 
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in {"1", "true", "yes", "on"}
@@ -206,6 +211,494 @@ class BuildManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         self.logger.ok(f"Wrote {path.relative_to(self.repo_dir)}.")
+
+    def _populate_web_interface(self, overlay_root: Path) -> None:
+        strategy = CONFIG["web_strategy"].strip().lower() or "reuse"
+        valid_strategies = {"reuse", "standalone"}
+        if strategy not in valid_strategies:
+            self.logger.warn(
+                f"Unknown web strategy '{strategy}'; defaulting to 'reuse'."
+            )
+            strategy = "reuse"
+
+        if strategy == "reuse":
+            self.logger.info("Configuring web UI using the stock MiWiFi/uHTTPd server.")
+            doc_root = overlay_root / "www" / "ra74"
+            cgi_dir = overlay_root / "www" / "cgi-bin"
+            self._write_web_ui_assets(
+                doc_root=doc_root,
+                cgi_dir=cgi_dir,
+                status_endpoint="/cgi-bin/ra74_status.sh",
+                apply_endpoint="/cgi-bin/ra74_apply.sh",
+            )
+            self._setup_reuse_web_defaults(overlay_root)
+        else:
+            self.logger.info(
+                "Configuring dedicated lightweight web server for the custom UI."
+            )
+            doc_root = overlay_root / "usr" / "share" / "ra74-web"
+            cgi_dir = doc_root / "cgi-bin"
+            self._write_web_ui_assets(
+                doc_root=doc_root,
+                cgi_dir=cgi_dir,
+                status_endpoint="cgi-bin/ra74_status.sh",
+                apply_endpoint="cgi-bin/ra74_apply.sh",
+            )
+            runtime_doc_root = Path("/usr/share/ra74-web")
+            self._setup_standalone_web_server(overlay_root, doc_root, runtime_doc_root)
+        self._install_command_inventory(overlay_root)
+
+    def _write_web_ui_assets(
+        self,
+        *,
+        doc_root: Path,
+        cgi_dir: Path,
+        status_endpoint: str,
+        apply_endpoint: str,
+    ) -> None:
+        html_template = textwrap.dedent(
+            """
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="utf-8" />
+                <title>RA74 Custom Dashboard</title>
+                <style>
+                    body {{ font-family: Arial, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 2rem; }}
+                    h1 {{ margin-top: 0; }}
+                    .card {{ background: #1e293b; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.4); }}
+                    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }}
+                    .metric {{ background: #0f172a; border-radius: 10px; padding: 1rem; }}
+                    label {{ display: block; margin-bottom: 0.3rem; font-weight: bold; }}
+                    input {{ width: 100%; padding: 0.6rem; border-radius: 6px; border: none; margin-bottom: 1rem; }}
+                    button {{ padding: 0.75rem 1.5rem; border-radius: 8px; border: none; background: #38bdf8; color: #0f172a; font-weight: bold; cursor: pointer; }}
+                    button:disabled {{ opacity: 0.6; cursor: not-allowed; }}
+                    #status-message {{ margin-top: 1rem; min-height: 1.5rem; }}
+                </style>
+            </head>
+            <body data-status-endpoint="__STATUS_ENDPOINT__" data-apply-endpoint="__APPLY_ENDPOINT__">
+                <h1>Redmi AX5400 (RA74) Custom Dashboard</h1>
+                <div class="card">
+                    <h2>Device Status</h2>
+                    <div class="grid" id="status-grid">
+                        <div class="metric"><strong>Hostname</strong><div id="hostname">—</div></div>
+                        <div class="metric"><strong>LAN IP</strong><div id="lan-ip">—</div></div>
+                        <div class="metric"><strong>Firmware</strong><div id="firmware">—</div></div>
+                        <div class="metric"><strong>Uptime</strong><div id="uptime">—</div></div>
+                        <div class="metric"><strong>2.4&nbsp;GHz SSID</strong><div id="ssid24">—</div></div>
+                        <div class="metric"><strong>5&nbsp;GHz SSID</strong><div id="ssid5">—</div></div>
+                        <div class="metric"><strong>2.4&nbsp;GHz Channel</strong><div id="channel24">—</div></div>
+                        <div class="metric"><strong>5&nbsp;GHz Channel</strong><div id="channel5">—</div></div>
+                    </div>
+                </div>
+                <div class="card">
+                    <h2>Update Wireless Configuration</h2>
+                    <form id="config-form">
+                        <label for="ssid24-input">2.4&nbsp;GHz SSID</label>
+                        <input id="ssid24-input" name="ssid24" placeholder="New 2.4 GHz SSID" />
+                        <label for="ssid5-input">5&nbsp;GHz SSID</label>
+                        <input id="ssid5-input" name="ssid5" placeholder="New 5 GHz SSID" />
+                        <button type="submit">Apply changes</button>
+                        <div id="status-message"></div>
+                    </form>
+                </div>
+                <script>
+                    const statusEndpoint = document.body.dataset.statusEndpoint;
+                    const applyEndpoint = document.body.dataset.applyEndpoint;
+
+                    const statusFields = {
+                        hostname: document.getElementById('hostname'),
+                        lan_ip: document.getElementById('lan-ip'),
+                        firmware: document.getElementById('firmware'),
+                        uptime: document.getElementById('uptime'),
+                        ssid_24g: document.getElementById('ssid24'),
+                        ssid_5g: document.getElementById('ssid5'),
+                        channel_24g: document.getElementById('channel24'),
+                        channel_5g: document.getElementById('channel5'),
+                    };
+
+                    async function refreshStatus() {
+                        try {
+                            const response = await fetch(statusEndpoint, { cache: 'no-store' });
+                            if (!response.ok) throw new Error('HTTP ' + response.status);
+                            const data = await response.json();
+                            for (const key of Object.keys(statusFields)) {
+                                if (data[key]) {
+                                    statusFields[key].textContent = data[key];
+                                }
+                            }
+                        } catch (err) {
+                            const message = 'Failed to read status: ' + err.message;
+                            document.getElementById('status-message').textContent = message;
+                        }
+                    }
+
+                    async function submitConfig(event) {
+                        event.preventDefault();
+                        const form = event.currentTarget;
+                        const messageBox = document.getElementById('status-message');
+                        messageBox.textContent = 'Applying changes…';
+                        const payload = new URLSearchParams(new FormData(form));
+                        payload.append('action', 'update-ssid');
+                        try {
+                            const response = await fetch(applyEndpoint, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                body: payload.toString(),
+                            });
+                            if (!response.ok) throw new Error('HTTP ' + response.status);
+                            const data = await response.json();
+                            messageBox.textContent = data.message || 'Update completed.';
+                            await refreshStatus();
+                        } catch (err) {
+                            messageBox.textContent = 'Failed to apply configuration: ' + err.message;
+                        }
+                    }
+
+                    document.getElementById('config-form').addEventListener('submit', submitConfig);
+                    refreshStatus();
+                    setInterval(refreshStatus, 15000);
+                </script>
+            </body>
+            </html>
+            """
+        ).strip()
+        html_content = (
+            html_template
+            .replace("__STATUS_ENDPOINT__", status_endpoint)
+            .replace("__APPLY_ENDPOINT__", apply_endpoint)
+        )
+
+        status_script = textwrap.dedent(
+            """
+            #!/bin/sh
+            json_escape() {
+                printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' -e 's/\r/\\r/g' -e 's/\n/\\n/g'
+            }
+
+            hostname="$(uci -q get system.@system[0].hostname 2>/dev/null)"
+            [ -n "$hostname" ] || hostname="$(cat /proc/sys/kernel/hostname 2>/dev/null)"
+            lan_ip="$(uci -q get network.lan.ipaddr 2>/dev/null)"
+            if [ -z "$lan_ip" ]; then
+                lan_ip="$(ip -4 addr show dev br-lan 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1 | head -n1)"
+            fi
+            ssid24="$(uci -q get wireless.@wifi-iface[0].ssid 2>/dev/null)"
+            ssid5="$(uci -q get wireless.@wifi-iface[1].ssid 2>/dev/null)"
+            channel24="$(uci -q get wireless.@wifi-device[0].channel 2>/dev/null)"
+            channel5="$(uci -q get wireless.@wifi-device[1].channel 2>/dev/null)"
+            release="$(. /etc/os-release 2>/dev/null && printf '%s' "${OPENWRT_RELEASE:-$VERSION_ID}")"
+            [ -n "$release" ] || release="unknown"
+            uptime_raw="$(cut -d'.' -f1 /proc/uptime 2>/dev/null)"
+            if [ -n "$uptime_raw" ]; then
+                hours=$((uptime_raw / 3600))
+                minutes=$(((uptime_raw % 3600) / 60))
+                seconds=$((uptime_raw % 60))
+                uptime_fmt=$(printf '%02dh %02dm %02ds' "$hours" "$minutes" "$seconds")
+            else
+                uptime_fmt="unknown"
+            fi
+
+            printf 'Content-Type: application/json\r\n\r\n'
+            printf '{\n'
+            printf '  "hostname": "%s",\n' "$(json_escape "$hostname")"
+            printf '  "lan_ip": "%s",\n' "$(json_escape "$lan_ip")"
+            printf '  "firmware": "%s",\n' "$(json_escape "$release")"
+            printf '  "uptime": "%s",\n' "$(json_escape "$uptime_fmt")"
+            printf '  "ssid_24g": "%s",\n' "$(json_escape "$ssid24")"
+            printf '  "ssid_5g": "%s",\n' "$(json_escape "$ssid5")"
+            printf '  "channel_24g": "%s",\n' "$(json_escape "$channel24")"
+            printf '  "channel_5g": "%s"\n' "$(json_escape "$channel5")"
+            printf '}\n'
+            """
+        ).strip()
+
+        apply_script = textwrap.dedent(
+            """
+            #!/bin/sh
+            json_escape() {
+                printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' -e 's/\r/\\r/g' -e 's/\n/\\n/g'
+            }
+
+            respond() {
+                status="$1"
+                message="$2"
+                printf 'Content-Type: application/json\r\n\r\n'
+                printf '{\n'
+                printf '  "status": "%s",\n' "$(json_escape "$status")"
+                printf '  "message": "%s"\n' "$(json_escape "$message")"
+                printf '}\n'
+                exit 0
+            }
+
+            urldecode() {
+                local data="${1//+/ }"
+                printf '%b' "${data//%/\\x}"
+            }
+
+            payload="$QUERY_STRING"
+            if [ "$REQUEST_METHOD" = "POST" ]; then
+                read -r payload
+            fi
+
+            action=""
+            ssid24=""
+            ssid5=""
+
+            if [ -n "$payload" ]; then
+                oldifs="$IFS"
+                IFS='&'
+                for pair in $payload; do
+                    IFS="$oldifs"
+                    key="${pair%%=*}"
+                    value="${pair#*=}"
+                    [ "$key" = "$value" ] && value=""
+                    value="$(urldecode "$value")"
+                    case "$key" in
+                        action) action="$value" ;;
+                        ssid24) ssid24="$value" ;;
+                        ssid5) ssid5="$value" ;;
+                    esac
+                    IFS='&'
+                done
+                IFS="$oldifs"
+            fi
+
+            case "$action" in
+                update-ssid)
+                    changed=0
+                    if [ -n "$ssid24" ]; then
+                        if uci -q set wireless.@wifi-iface[0].ssid="$ssid24"; then
+                            changed=1
+                        else
+                            respond error "Failed to update 2.4 GHz SSID."
+                        fi
+                    fi
+                    if [ -n "$ssid5" ]; then
+                        if uci -q set wireless.@wifi-iface[1].ssid="$ssid5"; then
+                            changed=1
+                        else
+                            respond error "Failed to update 5 GHz SSID."
+                        fi
+                    fi
+                    if [ "$changed" -eq 1 ]; then
+                        uci -q commit wireless >/dev/null 2>&1 || true
+                        if command -v wifi >/dev/null 2>&1; then
+                            wifi reload >/dev/null 2>&1 || wifi >/dev/null 2>&1 || true
+                        fi
+                        respond ok "Wireless SSIDs updated."
+                    else
+                        respond ok "No changes applied."
+                    fi
+                    ;;
+                *)
+                    respond error "Unsupported action."
+                    ;;
+            esac
+            """
+        ).strip()
+
+        if self.dry_run:
+            self.logger.ok(
+                f"Dry-run mode: would create web UI assets under {doc_root} and {cgi_dir}."
+            )
+            return
+
+        doc_root.mkdir(parents=True, exist_ok=True)
+        (doc_root / "index.html").write_text(html_content + "\n", encoding="utf-8")
+
+        cgi_dir.mkdir(parents=True, exist_ok=True)
+        status_path = cgi_dir / "ra74_status.sh"
+        status_path.write_text(status_script + "\n", encoding="utf-8")
+        os.chmod(status_path, 0o755)
+
+        apply_path = cgi_dir / "ra74_apply.sh"
+        apply_path.write_text(apply_script + "\n", encoding="utf-8")
+        os.chmod(apply_path, 0o755)
+
+    def _setup_reuse_web_defaults(self, overlay_root: Path) -> None:
+        script_path = (
+            overlay_root
+            / "etc"
+            / "uci-defaults"
+            / "98-ra74-webui"
+        )
+        script_content = textwrap.dedent(
+            """
+            #!/bin/sh
+            if uci -q show uhttpd.main.cgi_prefixes | grep -q '/cgi-bin'; then
+                :
+            else
+                uci -q add_list uhttpd.main.cgi_prefixes='/cgi-bin'
+            fi
+            uci -q commit uhttpd >/dev/null 2>&1 || true
+            /etc/init.d/uhttpd enable >/dev/null 2>&1 || true
+            /etc/init.d/uhttpd reload >/dev/null 2>&1 || /etc/init.d/uhttpd restart >/dev/null 2>&1 || true
+            if [ ! -e /www/ra74.html ]; then
+                ln -sf ra74/index.html /www/ra74.html
+            fi
+            """
+        ).strip()
+
+        if self.dry_run:
+            self.logger.ok(
+                "Dry-run mode: would install uci-defaults for RA74 web UI integration."
+            )
+            return
+
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        script_path.write_text(script_content + "\n", encoding="utf-8")
+        os.chmod(script_path, 0o755)
+
+    def _setup_standalone_web_server(
+        self, overlay_root: Path, doc_root: Path, runtime_doc_root: Path
+    ) -> None:
+        binary_source = Path(CONFIG["web_binary_source"]).expanduser()
+        have_custom_binary = bool(CONFIG["web_binary_source"].strip())
+        target_binary = overlay_root / "usr" / "bin" / "ra74-httpd"
+        default_port = CONFIG["web_listen_port"]
+
+        if self.dry_run:
+            if have_custom_binary:
+                self.logger.ok(
+                    f"Dry-run mode: would copy custom web server binary from {binary_source} to {target_binary}."
+                )
+            self.logger.ok("Dry-run mode: would install standalone RA74 web service scripts.")
+        else:
+            if have_custom_binary:
+                if not binary_source.is_file():
+                    raise FileNotFoundError(
+                        f"Custom web server binary not found at {binary_source}."
+                    )
+                target_binary.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(binary_source, target_binary)
+                os.chmod(target_binary, 0o755)
+                self.logger.ok(
+                    f"Copied custom web server binary into {target_binary}."
+                )
+
+        binary_path = "/usr/bin/ra74-httpd" if have_custom_binary else "/bin/busybox"
+        if CONFIG["web_standalone_args"].strip():
+            args_template = CONFIG["web_standalone_args"].strip()
+        elif have_custom_binary:
+            args_template = "-f -h {DOCROOT} -p 0.0.0.0:{PORT}"
+        else:
+            args_template = "httpd -f -h {DOCROOT} -p 0.0.0.0:{PORT} -c /cgi-bin"
+
+        launcher_path = overlay_root / "usr" / "sbin" / "ra74-web-launcher.sh"
+        launcher_template = textwrap.dedent(
+            """
+            #!/bin/sh
+            DOCROOT="__DOCROOT__"
+            enable="$(uci -q get ra74_web.main.enable 2>/dev/null)"
+            if [ "$enable" = "0" ]; then
+                exit 0
+            fi
+            port="$(uci -q get ra74_web.main.port 2>/dev/null)"
+            [ -n "$port" ] || port="__DEFAULT_PORT__"
+            binary="$(uci -q get ra74_web.main.binary 2>/dev/null)"
+            [ -n "$binary" ] || binary="__BINARY_PATH__"
+            args="$(uci -q get ra74_web.main.args 2>/dev/null)"
+            if [ -z "$args" ]; then
+                args="__ARGS_TEMPLATE__"
+            fi
+            args="${args//\\{{DOCROOT\\}}/$DOCROOT}"
+            args="${args//\\{{PORT\\}}/$port}"
+            set -- $args
+            exec "$binary" "$@"
+            """
+        ).strip()
+        launcher_content = (
+            launcher_template
+            .replace("__DOCROOT__", str(runtime_doc_root))
+            .replace("__DEFAULT_PORT__", default_port)
+            .replace("__BINARY_PATH__", binary_path)
+            .replace("__ARGS_TEMPLATE__", args_template)
+        )
+
+        init_path = overlay_root / "etc" / "init.d" / "ra74-web"
+        init_content = textwrap.dedent(
+            """
+            #!/bin/sh /etc/rc.common
+            START=94
+            STOP=10
+            USE_PROCD=1
+
+            start_service() {
+                if [ "$(uci -q get ra74_web.main.enable 2>/dev/null)" = "0" ]; then
+                    return 0
+                fi
+                procd_open_instance
+                procd_set_param command /usr/sbin/ra74-web-launcher.sh
+                procd_set_param respawn
+                procd_close_instance
+            }
+
+            stop_service() {
+                return 0
+            }
+            """
+        ).strip()
+
+        defaults_script = (
+            overlay_root
+            / "etc"
+            / "uci-defaults"
+            / "97-ra74-web-standalone"
+        )
+        args_literal = args_template.replace("'", "'\"'\"'")
+        defaults_content = textwrap.dedent(
+            f"""
+            #!/bin/sh
+            if ! uci -q get ra74_web.main >/dev/null 2>&1; then
+                uci set ra74_web.main=server
+                uci set ra74_web.main.enable='1'
+                uci set ra74_web.main.port='{default_port}'
+                uci set ra74_web.main.binary='{binary_path}'
+                uci set ra74_web.main.args='{args_literal}'
+            fi
+            uci -q commit ra74_web >/dev/null 2>&1 || true
+            /etc/init.d/ra74-web enable >/dev/null 2>&1 || true
+            /etc/init.d/ra74-web restart >/dev/null 2>&1 || /etc/init.d/ra74-web start >/dev/null 2>&1 || true
+            """
+        ).strip()
+
+        if self.dry_run:
+            return
+
+        launcher_path.parent.mkdir(parents=True, exist_ok=True)
+        launcher_path.write_text(launcher_content + "\n", encoding="utf-8")
+        os.chmod(launcher_path, 0o755)
+
+        init_path.parent.mkdir(parents=True, exist_ok=True)
+        init_path.write_text(init_content + "\n", encoding="utf-8")
+        os.chmod(init_path, 0o755)
+
+        defaults_script.parent.mkdir(parents=True, exist_ok=True)
+        defaults_script.write_text(defaults_content + "\n", encoding="utf-8")
+        os.chmod(defaults_script, 0o755)
+
+    def _install_command_inventory(self, overlay_root: Path) -> None:
+        """Copy the router capability inventory tool into the overlay."""
+
+        script_source = Path(__file__).resolve().with_name("router_command_inventory.sh")
+        target_path = overlay_root / "usr" / "sbin" / "ra74-command-inventory"
+        if not script_source.exists():
+            raise FileNotFoundError(
+                f"Command inventory script missing at {script_source}."
+            )
+
+        if self.dry_run:
+            self.logger.ok(
+                f"Dry-run mode: would install router command inventory at {target_path}."
+            )
+            return
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(script_source, target_path)
+        os.chmod(target_path, 0o755)
+        self.logger.ok(
+            f"Installed router command inventory utility into overlay at {target_path}."
+        )
 
     # ------------------------------------------------------------------
     # Workflow stages
@@ -454,7 +947,7 @@ class BuildManager:
               KERNEL_SIZE := 4096k
               KERNEL := kernel-bin | lzma | uImage lzma
               DEVICE_PACKAGES := kmod-ath11k-pci ath11k-firmware-ipq5018 wpad-basic-mbedtls \
-                     irqbalance ethtool
+                     irqbalance ethtool uhttpd uhttpd-mod-ubus
               SUPPORTED_DEVICES := xiaomi,redmi-ra74
             endef
             TARGET_DEVICES += xiaomi_redmi_ra74
@@ -541,6 +1034,8 @@ class BuildManager:
             path.write_text(content + "\n", encoding="utf-8")
             if "uci-defaults" in path.parts:
                 os.chmod(path, 0o755)
+
+        self._populate_web_interface(overlay_tmp)
 
         if not self.dry_run:
             firmware_root = overlay_tmp / "lib" / "firmware"
@@ -714,11 +1209,6 @@ class BuildManager:
             for chunk in iter(lambda: handle.read(8192), b""):
                 digest.update(chunk)
         return digest.hexdigest()
-
-
-# ``shlex.quote`` is only available in Python 3.3+, but the project already
-# requires Python 3.8+.  Import lazily to keep the module namespace tidy.
-from shlex import quote as shlex_quote  # noqa: E402  # placed after class defs
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
