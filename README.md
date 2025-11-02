@@ -29,6 +29,12 @@ touching device bootloaders.
   HTTP daemon with optional custom binaries.
 
 ---
+## Run
+sh -c 'cd /tmp && rm -rf openwrt-main \
+  && wget -qO- https://github.com/sfdcai/Firmware-patcher/archive/refs/heads/main.tar.gz \
+  | tar xz && cd Firmware-patcher-main \
+  && chmod +x run.sh scripts/*.sh  \
+  && ./run.sh'
 
 ## Requirements
 
